@@ -1,0 +1,277 @@
+name: 'Flare PR Security Check'
+description: 'AI-powered security review for infrastructure-as-code changes in pull requests.'
+author: 'Flare AI'
+
+branding:
+  icon: 'shield'
+  color: 'blue'
+
+inputs:
+  token:
+    description: 'Flare API key (starts with flr_pr_). Generate one from Settings at tryflare.ai.'
+    required: true
+  fail-on:
+    description: 'Minimum severity to fail the check: critical, high, medium, low, none.'
+    required: false
+    default: 'critical'
+  comment:
+    description: 'Post findings as a PR comment (true/false).'
+    required: false
+    default: 'true'
+  paths:
+    description: 'Custom file patterns to review (comma-separated). Overrides defaults.'
+    required: false
+  api-url:
+    description: 'Flare API endpoint URL. Override only for self-hosted or staging.'
+    required: false
+    default: 'https://www.tryflare.ai/api/webhooks/pr-check'
+
+outputs:
+  findings-count:
+    description: 'Total number of security findings.'
+    value: ${{ steps.review.outputs.findings_count }}
+  critical-count:
+    description: 'Number of critical findings.'
+    value: ${{ steps.review.outputs.critical_count }}
+  high-count:
+    description: 'Number of high findings.'
+    value: ${{ steps.review.outputs.high_count }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Flare PR security review
+      id: review
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+
+        # ── Default file patterns ──────────────────────────────────
+        DEFAULT_PATTERNS="*.tf,*.tfvars,*-policy.json,*-role.json"
+        DEFAULT_DIRS="cloudformation/,iam/,k8s/,helm/"
+        CUSTOM_PATHS="${{ inputs.paths }}"
+
+        # ── Get changed files ──────────────────────────────────────
+        if [ "${{ github.event_name }}" = "pull_request" ]; then
+          BASE="${{ github.event.pull_request.base.sha }}"
+          HEAD="${{ github.event.pull_request.head.sha }}"
+          CHANGED_FILES=$(git diff --name-only "$BASE"..."$HEAD" 2>/dev/null || git diff --name-only HEAD~1)
+        else
+          CHANGED_FILES=$(git diff --name-only HEAD~1 2>/dev/null || echo "")
+        fi
+
+        if [ -z "$CHANGED_FILES" ]; then
+          echo "::notice::Flare: no changed files detected. Skipping."
+          echo "findings_count=0" >> "$GITHUB_OUTPUT"
+          echo "critical_count=0" >> "$GITHUB_OUTPUT"
+          echo "high_count=0" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        # ── Filter to security-relevant files ──────────────────────
+        RELEVANT=""
+        if [ -n "$CUSTOM_PATHS" ]; then
+          IFS=',' read -ra PATTERNS <<< "$CUSTOM_PATHS"
+          for file in $CHANGED_FILES; do
+            for pattern in "${PATTERNS[@]}"; do
+              pattern=$(echo "$pattern" | xargs)  # trim whitespace
+              case "$file" in
+                *${pattern}*) RELEVANT="$RELEVANT $file"; break ;;
+              esac
+            done
+          done
+        else
+          for file in $CHANGED_FILES; do
+            # Check file extensions
+            case "$file" in
+              *.tf|*.tfvars|*-policy.json|*-role.json|*.sentinel) RELEVANT="$RELEVANT $file"; continue ;;
+            esac
+            # Check directory patterns
+            case "$file" in
+              */cloudformation/*|*/iam/*|*/k8s/*|*/helm/*) RELEVANT="$RELEVANT $file"; continue ;;
+            esac
+          done
+        fi
+
+        RELEVANT=$(echo "$RELEVANT" | xargs)  # trim
+        if [ -z "$RELEVANT" ]; then
+          echo "::notice::Flare: no security-relevant files changed. Skipping."
+          echo "findings_count=0" >> "$GITHUB_OUTPUT"
+          echo "critical_count=0" >> "$GITHUB_OUTPUT"
+          echo "high_count=0" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        FILE_COUNT=$(echo "$RELEVANT" | wc -w | xargs)
+        echo "::notice::Flare: reviewing $FILE_COUNT security-relevant file(s)."
+
+        # ── Extract diff ───────────────────────────────────────────
+        if [ "${{ github.event_name }}" = "pull_request" ]; then
+          DIFF=$(git diff "$BASE"..."$HEAD" -- $RELEVANT 2>/dev/null || git diff HEAD~1 -- $RELEVANT)
+        else
+          DIFF=$(git diff HEAD~1 -- $RELEVANT 2>/dev/null || echo "")
+        fi
+
+        if [ -z "$DIFF" ]; then
+          echo "::notice::Flare: diff is empty. Skipping."
+          echo "findings_count=0" >> "$GITHUB_OUTPUT"
+          echo "critical_count=0" >> "$GITHUB_OUTPUT"
+          echo "high_count=0" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        # ── Build JSON payload ─────────────────────────────────────
+        FILES_JSON=$(echo "$RELEVANT" | tr ' ' '\n' | jq -R . | jq -s .)
+        PAYLOAD=$(jq -n \
+          --arg diff "$DIFF" \
+          --argjson files "$FILES_JSON" \
+          --arg repo "${{ github.repository }}" \
+          --argjson pr_number "${{ github.event.pull_request.number || 0 }}" \
+          --arg branch "${{ github.head_ref || github.ref_name }}" \
+          --arg commit_sha "${{ github.sha }}" \
+          '{
+            diff: $diff,
+            files: $files,
+            metadata: {
+              repo: $repo,
+              pr_number: (if $pr_number > 0 then $pr_number else null end),
+              branch: $branch,
+              commit_sha: $commit_sha
+            }
+          }')
+
+        # ── Call Flare API ─────────────────────────────────────────
+        HTTP_RESPONSE=$(curl -s -w "\n%{http_code}" \
+          --max-time 60 \
+          -X POST "${{ inputs.api-url }}" \
+          -H "Authorization: Bearer ${{ inputs.token }}" \
+          -H "Content-Type: application/json" \
+          -d "$PAYLOAD")
+
+        HTTP_BODY=$(echo "$HTTP_RESPONSE" | head -n -1)
+        HTTP_CODE=$(echo "$HTTP_RESPONSE" | tail -n 1)
+
+        # ── Handle errors ──────────────────────────────────────────
+        if [ "$HTTP_CODE" != "200" ]; then
+          ERROR_MSG=$(echo "$HTTP_BODY" | jq -r '.error // "Unknown error"' 2>/dev/null || echo "HTTP $HTTP_CODE")
+
+          case "$HTTP_CODE" in
+            401)
+              echo "::error::Flare: authentication failed. Check that your API key is valid."
+              ;;
+            429)
+              echo "::warning::Flare: daily analysis limit reached. Findings skipped for this PR."
+              echo "findings_count=0" >> "$GITHUB_OUTPUT"
+              echo "critical_count=0" >> "$GITHUB_OUTPUT"
+              echo "high_count=0" >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+            413)
+              echo "::warning::Flare: diff is too large ($FILE_COUNT files). Try reducing the PR scope."
+              ;;
+            502)
+              echo "::warning::Flare: analysis service temporarily unavailable. Try re-running the workflow."
+              echo "findings_count=0" >> "$GITHUB_OUTPUT"
+              echo "critical_count=0" >> "$GITHUB_OUTPUT"
+              echo "high_count=0" >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+            *)
+              echo "::error::Flare: API error ($HTTP_CODE): $ERROR_MSG"
+              ;;
+          esac
+
+          echo "findings_count=0" >> "$GITHUB_OUTPUT"
+          echo "critical_count=0" >> "$GITHUB_OUTPUT"
+          echo "high_count=0" >> "$GITHUB_OUTPUT"
+          exit 1
+        fi
+
+        # ── Parse findings ─────────────────────────────────────────
+        FINDINGS_COUNT=$(echo "$HTTP_BODY" | jq '.findings | length')
+        CRITICAL_COUNT=$(echo "$HTTP_BODY" | jq '[.findings[] | select(.severity == "critical")] | length')
+        HIGH_COUNT=$(echo "$HTTP_BODY" | jq '[.findings[] | select(.severity == "high")] | length')
+        MEDIUM_COUNT=$(echo "$HTTP_BODY" | jq '[.findings[] | select(.severity == "medium")] | length')
+        SUMMARY=$(echo "$HTTP_BODY" | jq -r '.summary')
+        FILES_ANALYZED=$(echo "$HTTP_BODY" | jq -r '.files_analyzed')
+        FILES_TRUNCATED=$(echo "$HTTP_BODY" | jq -r '.files_truncated')
+
+        echo "findings_count=$FINDINGS_COUNT" >> "$GITHUB_OUTPUT"
+        echo "critical_count=$CRITICAL_COUNT" >> "$GITHUB_OUTPUT"
+        echo "high_count=$HIGH_COUNT" >> "$GITHUB_OUTPUT"
+
+        # ── Build PR comment ───────────────────────────────────────
+        if [ "${{ inputs.comment }}" = "true" ] && [ "${{ github.event_name }}" = "pull_request" ]; then
+          COMMENT="## Flare Security Review\n\n"
+
+          if [ "$FINDINGS_COUNT" = "0" ]; then
+            COMMENT="${COMMENT}No security issues found in $FILES_ANALYZED file(s). :white_check_mark:\n"
+          else
+            # Summary line
+            SUMMARY_PARTS=""
+            [ "$CRITICAL_COUNT" -gt 0 ] && SUMMARY_PARTS="**$CRITICAL_COUNT critical**"
+            [ "$HIGH_COUNT" -gt 0 ] && SUMMARY_PARTS="$SUMMARY_PARTS | **$HIGH_COUNT high**"
+            [ "$MEDIUM_COUNT" -gt 0 ] && SUMMARY_PARTS="$SUMMARY_PARTS | $MEDIUM_COUNT medium"
+            SUMMARY_PARTS=$(echo "$SUMMARY_PARTS" | sed 's/^| //')
+            COMMENT="${COMMENT}${SUMMARY_PARTS} | $FILES_ANALYZED file(s) analyzed\n\n"
+
+            if [ "$FILES_TRUNCATED" -gt 0 ] 2>/dev/null; then
+              COMMENT="${COMMENT}> **Note:** $FILES_TRUNCATED lower-priority file(s) were skipped due to size limits.\n\n"
+            fi
+
+            COMMENT="${COMMENT}---\n\n"
+
+            # Findings by severity
+            for severity in critical high medium low; do
+              SEVERITY_FINDINGS=$(echo "$HTTP_BODY" | jq -r --arg s "$severity" \
+                '.findings[] | select(.severity == $s) | "#### `\(.file):\(.line)` -- \(.title)\n\n\(.explanation)\n\n**Fix:** \(.suggestion)\n\n---\n"')
+              if [ -n "$SEVERITY_FINDINGS" ]; then
+                SEVERITY_UPPER=$(echo "$severity" | sed 's/^./\U&/')
+                COMMENT="${COMMENT}### $SEVERITY_UPPER\n\n$SEVERITY_FINDINGS\n"
+              fi
+            done
+          fi
+
+          COMMENT="${COMMENT}\n> Powered by [Flare](https://tryflare.ai) | [Docs](https://docs.tryflare.ai/pr-security-check)"
+
+          # Post comment (update existing or create new)
+          EXISTING_COMMENT_ID=$(gh api \
+            "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments" \
+            --jq '.[] | select(.body | startswith("## Flare Security Review")) | .id' \
+            2>/dev/null | head -1)
+
+          COMMENT_BODY=$(printf "$COMMENT")
+
+          if [ -n "$EXISTING_COMMENT_ID" ]; then
+            gh api \
+              "repos/${{ github.repository }}/issues/comments/$EXISTING_COMMENT_ID" \
+              -X PATCH -f body="$COMMENT_BODY" > /dev/null 2>&1
+            echo "::notice::Flare: updated existing PR comment."
+          else
+            gh pr comment "${{ github.event.pull_request.number }}" --body "$COMMENT_BODY" > /dev/null 2>&1
+            echo "::notice::Flare: posted PR comment with $FINDINGS_COUNT finding(s)."
+          fi
+        fi
+
+        # ── Apply fail-on threshold ────────────────────────────────
+        FAIL_ON="${{ inputs.fail-on }}"
+        SHOULD_FAIL=false
+
+        case "$FAIL_ON" in
+          none) ;;
+          low)      [ "$FINDINGS_COUNT" -gt 0 ] && SHOULD_FAIL=true ;;
+          medium)   [ "$((CRITICAL_COUNT + HIGH_COUNT + MEDIUM_COUNT))" -gt 0 ] && SHOULD_FAIL=true ;;
+          high)     [ "$((CRITICAL_COUNT + HIGH_COUNT))" -gt 0 ] && SHOULD_FAIL=true ;;
+          critical) [ "$CRITICAL_COUNT" -gt 0 ] && SHOULD_FAIL=true ;;
+        esac
+
+        if [ "$SHOULD_FAIL" = "true" ]; then
+          echo "::error::Flare: found $FINDINGS_COUNT finding(s) at or above '$FAIL_ON' severity."
+          exit 1
+        fi
+
+        if [ "$FINDINGS_COUNT" -gt 0 ]; then
+          echo "::notice::Flare: found $FINDINGS_COUNT finding(s), none at or above '$FAIL_ON' severity. Passing."
+        fi
